@@ -694,6 +694,7 @@ func (e *engine) answer(c *Call) error {
 	e.mu.Lock()
 	m.acceptPending = true
 	seen, from, creator := m.muteSeen, m.muteFrom, m.muteCreator
+	offerFrom, offerCreator := m.from, m.creator
 	e.mu.Unlock()
 
 	c.setPhase(CallPhaseConnecting)
@@ -701,14 +702,18 @@ func (e *engine) answer(c *Call) error {
 	// Answered after the caller's first <mute_v2> (a person clicked Answer seconds into the
 	// ring): no further mute_v2 will come, so accept now or the caller keeps ringing.
 	if seen {
-		e.sendAccept(c.id, from, creator)
+		e.sendAccept(c.id, from, creator, "mute_v2")
+	} else {
+		time.AfterFunc(2*time.Second, func() {
+			e.sendAccept(c.id, offerFrom, offerCreator, "mute_v2_timeout")
+		})
 	}
 	return nil
 }
 
 // sendAccept sends the deferred callee <accept> (once), in the WA-Web format (metadata +
 // single rate — the peer keeps the call alive with this; capability+both-rates fails).
-func (e *engine) sendAccept(callID string, to, creator types.JID) {
+func (e *engine) sendAccept(callID string, to, creator types.JID, trigger string) {
 	e.mu.Lock()
 	m := e.calls[callID]
 	if m == nil || !m.acceptPending {
@@ -730,7 +735,7 @@ func (e *engine) sendAccept(callID string, to, creator types.JID) {
 		e.c.log.Error().Err(err).Str("call_id", callID).Msg("send accept failed")
 		return
 	}
-	e.c.log.Info().Str("call_id", callID).Bool("video", isVideo).Msg("accepted (after mute_v2)")
+	e.c.log.Info().Str("call_id", callID).Bool("video", isVideo).Str("trigger", trigger).Msg("sent WhatsApp accept")
 }
 
 // reject declines an inbound call.
@@ -1191,7 +1196,7 @@ func (e *engine) onCallRaw(callNode *waBinary.Node) bool {
 			Str("mute_state", muteState).
 			Bool("muted", muted).
 			Msg("first mute_v2 received; sending deferred accept")
-		e.sendAccept(callID, callNode.AttrGetter().JID("from"), mv.JID("call-creator"))
+		e.sendAccept(callID, callNode.AttrGetter().JID("from"), mv.JID("call-creator"), "mute_v2")
 		return false
 	case "video":
 		// Acknowledge the <video> stanza with type="video" — the mid-call video-upgrade
