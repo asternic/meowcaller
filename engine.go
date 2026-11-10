@@ -53,26 +53,29 @@ type engineCall struct {
 	creator types.JID // call-creator JID (for accept/relaylatency)
 	from    types.JID // the <call> "from" — where stanzas are addressed
 
-	direction         CallDirection
-	codec             AudioCodec   // audio codec for this call, selected from voip_settings (MLow default)
-	localVideo        bool         // this client is sending, or has requested to send, video
-	remoteVideo       bool         // the peer is sending video to this client
-	videoGate         bool         // outbound upgrade is waiting for peer acceptance
-	peerVideoUpgrade  bool         // the peer's inbound upgrade is waiting for local acceptance
-	videoTx           *videoSender // video send pipeline, live while media runs
-	appDataTx         *appDataSender
-	rekeyPeer         func(string) error
-	group             bool
-	groupUpdate       *groupCallUpdate
-	groupReceivers    *participantReceiveRegistry
-	groupRawEpoch     []byte
-	groupEpochTxID    uint32
-	hasGroupEpoch     bool
-	started           bool
-	cancel            context.CancelFunc // tears down this call's media goroutine
-	waitingRoomCancel context.CancelFunc
-	inviteSelfDevice  groupCallDevice
-	invitePeerDevice  groupCallDevice
+	// A false value means that an invited device has not rejected with reason=enc.
+	deviceEncryptionFailures map[types.JID]bool
+	peerAnswered             bool
+	direction                CallDirection
+	codec                    AudioCodec   // audio codec for this call, selected from voip_settings (MLow default)
+	localVideo               bool         // this client is sending, or has requested to send, video
+	remoteVideo              bool         // the peer is sending video to this client
+	videoGate                bool         // outbound upgrade is waiting for peer acceptance
+	peerVideoUpgrade         bool         // the peer's inbound upgrade is waiting for local acceptance
+	videoTx                  *videoSender // video send pipeline, live while media runs
+	appDataTx                *appDataSender
+	rekeyPeer                func(string) error
+	group                    bool
+	groupUpdate              *groupCallUpdate
+	groupReceivers           *participantReceiveRegistry
+	groupRawEpoch            []byte
+	groupEpochTxID           uint32
+	hasGroupEpoch            bool
+	started                  bool
+	cancel                   context.CancelFunc // tears down this call's media goroutine
+	waitingRoomCancel        context.CancelFunc
+	inviteSelfDevice         groupCallDevice
+	invitePeerDevice         groupCallDevice
 
 	// The callee <accept> is deferred until the caller's <mute_v2> arrives.
 	acceptPending bool
@@ -491,6 +494,10 @@ func (e *engine) placeCall(ctx context.Context, target string, opts CallOptions)
 	m.creator = self
 	m.from = peerLID
 	m.direction = CallDirectionOutgoing
+	m.deviceEncryptionFailures = make(map[types.JID]bool, len(devices))
+	for _, device := range devices {
+		m.deviceEncryptionFailures[device] = false
+	}
 	m.localVideo = opts.Video
 	m.remoteVideo = opts.Video
 	m.inviteSelfDevice = groupCallDevice{
@@ -966,6 +973,7 @@ func (e *engine) onAccept(ev *events.CallAccept) {
 	var rekeyPeer func(string) error
 	answeringPeer := ev.From.String()
 	if current := e.calls[ev.CallID]; current != nil {
+		current.peerAnswered = true
 		if device, ok := inviteDeviceCapability(ev.From, ev.Data); ok {
 			current.invitePeerDevice = device
 		}
@@ -1048,6 +1056,37 @@ func preferQualifiedPeer(current string, signaled types.JID) string {
 func (e *engine) onReject(ev *events.CallReject) {
 	m := e.lookup(ev.CallID)
 	if m == nil {
+		return
+	}
+	reason := ""
+	if ev.Data != nil {
+		reason = ev.Data.AttrGetter().OptionalString("reason")
+	}
+	if reason == "enc" && m.direction == CallDirectionOutgoing && !m.group {
+		e.mu.Lock()
+		current := e.calls[ev.CallID]
+		remaining := 0
+		known := false
+		answered := false
+		if current != nil {
+			answered = current.peerAnswered
+			_, known = current.deviceEncryptionFailures[ev.From]
+			if known && !answered {
+				current.deviceEncryptionFailures[ev.From] = true
+				for _, failed := range current.deviceEncryptionFailures {
+					if !failed {
+						remaining++
+					}
+				}
+			}
+		}
+		e.mu.Unlock()
+		e.c.log.Warn().Str("call_id", ev.CallID).Str("from", ev.From.String()).
+			Bool("invited_device", known).Bool("peer_answered", answered).
+			Int("remaining_devices", remaining).Msg("device rejected call encryption")
+		if known && !answered && remaining == 0 {
+			e.finishCall(ev.CallID, "encryption_failed")
+		}
 		return
 	}
 	e.c.log.Info().
@@ -1332,6 +1371,11 @@ func (e *engine) finishCall(callID, reason string) {
 	}
 	e.mu.Lock()
 	m := e.calls[callID]
+	// An accept may have raced with the last device's encryption rejection.
+	if reason == "encryption_failed" && m != nil && m.peerAnswered {
+		e.mu.Unlock()
+		return
+	}
 	if m != nil {
 		delete(e.calls, callID)
 	}
